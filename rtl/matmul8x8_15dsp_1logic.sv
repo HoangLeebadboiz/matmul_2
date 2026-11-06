@@ -5,8 +5,10 @@
 // Each physical grid owns one 2x2 C tile and ONE shared multiplier/adder.
 // G00..G32 prefer hard multipliers; G33 uses logic (15 hard + 1 soft intent).
 // A tiles multicast across grid rows; B tiles multicast down grid columns.
-// Totals: 16 grids, 16 multipliers, 64 accumulators, EIGHT packed RAM banks.
-// Default banks are 8 x 32 bits: each 2x2 input tile occupies TWO addresses.
+// Revision BRAM_ACC: 64 partial sums live in 16 additional M9K banks.
+// Target: 8 input M9Ks + 16 accumulator M9Ks = 24 of EP4CE6's 30 M9Ks.
+// Default input banks: 8 x 32 bits; each 2x2 tile occupies TWO addresses.
+// Output is a 16-to-1 RAM-output mux instead of a 64-to-1 register mux.
 // Confirm actual mapping, LE usage and timing in Quartus for EP4CE6E22C8.
 module matmul8x8_15dsp_1logic #(
     parameter integer DATA_W = 16,
@@ -36,7 +38,7 @@ module matmul8x8_15dsp_1logic #(
     logic [1:0] k_tile;
     logic [5:0] out_index;
     localparam integer STEPS_PER_K = 4;
-    localparam logic [2:0] LAST_ISSUE = 2*STEPS_PER_K - 1;
+    localparam logic [2:0] LAST_ISSUE = 3'd7;
     logic [2:0] issue_index;
     wire wr_fire, wr_a, wr_b;
     wire ram_rd_en, issue, phase, first_step, last_step;
@@ -52,7 +54,11 @@ module matmul8x8_15dsp_1logic #(
     wire signed [DATA_W-1:0] a_bus [0:7];
     wire signed [DATA_W-1:0] b_bus [0:7];
     wire [15:0] grid_done;
-    wire signed [ACC_W-1:0] c_flat [0:63];
+    wire signed [ACC_W-1:0] grid_result [0:15];
+    wire result_prefetch;
+    wire [5:0] prefetch_addr;
+    wire [3:0] prefetch_grid, output_grid;
+    wire [1:0] prefetch_dest;
 
     // synthesis translate_off
     initial begin
@@ -78,6 +84,17 @@ module matmul8x8_15dsp_1logic #(
     // This stays high for all four destinations at k=0.
     assign first_step = (k_tile == 2'd0) && !phase;
     assign last_step = (issue_index == LAST_ISSUE);
+
+    // Read C[0] on the final DRAIN edge, after the last RAM write completed.
+    // Thereafter fetch the NEXT scalar only when the current one is accepted.
+    // A stalled output causes no new read: RAM output/address remain stable.
+    assign result_prefetch = !rst &&
+        (((state == DRAIN) && (k_tile == 2'd3) && (&grid_done)) ||
+         ((state == WRITE_C) && result_ready && (out_index != 6'd63)));
+    assign prefetch_addr = (state == WRITE_C) ? out_index + 6'd1 : 6'd0;
+    assign prefetch_grid = {prefetch_addr[5:4], prefetch_addr[2:1]};
+    assign prefetch_dest = {prefetch_addr[3], prefetch_addr[0]};
+    assign output_grid = {out_index[5:4], out_index[2:1]};
 
     // Four A banks, one per pair of rows. A tile is packed by COLUMN:
     //   mem[2*t]   = {A[2*i+1][2*t],   A[2*i][2*t]}.
@@ -122,21 +139,20 @@ module matmul8x8_15dsp_1logic #(
                     .dest(issue_index[1:0]),
                     .a0(a_bus[2*grid_row]), .a1(a_bus[2*grid_row+1]),
                     .b0(b_bus[2*grid_col]), .b1(b_bus[2*grid_col+1]),
-                    .c00(c_flat[(2*grid_row)*8 + 2*grid_col]),
-                    .c01(c_flat[(2*grid_row)*8 + 2*grid_col+1]),
-                    .c10(c_flat[(2*grid_row+1)*8 + 2*grid_col]),
-                    .c11(c_flat[(2*grid_row+1)*8 + 2*grid_col+1]),
+                    .readout_valid(result_prefetch &&
+                                   prefetch_grid == 4*grid_row+grid_col),
+                    .readout_dest(prefetch_dest),
+                    .readout_data(grid_result[4*grid_row+grid_col]),
                     .chunk_done(grid_done[4*grid_row+grid_col])
                 );
             end
         end
     endgenerate
 
-    // All 64 accumulators stay still throughout output, including stalls.
-    // Stream results in scalar row-major order.
+    // Accumulator RAM is read-only during output. Stream in row-major order.
     assign result_valid = !rst && (state == WRITE_C);
     assign result_addr = out_index;
-    assign result_data = c_flat[out_index];
+    assign result_data = grid_result[output_grid];
 
     always_ff @(posedge clk) begin
         if (rst) begin

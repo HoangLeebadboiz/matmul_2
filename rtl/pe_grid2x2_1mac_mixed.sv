@@ -1,12 +1,13 @@
 `timescale 1ns/1ps
 `default_nettype none
 
-// One multiplier/adder shared by FOUR output accumulators.
+// One multiplier/adder shared by FOUR partial sums stored in one M9K.
 // For each scalar k, issue dest=0,1,2,3 (C00,C01,C10,C11).
 // first_step must be high for ALL FOUR destinations at the first k.
-// Stage 1 registers product/destination; stage 2 updates that destination.
+// Stage 1 registers product/destination AND synchronously reads old C.
+// Stage 2 adds old C to product and writes that destination to RAM.
 // USE_LOGIC_MULT selects a synthesis implementation, NOT extra latency.
-// Both branches retain exactly the same product register and accumulator.
+// Both branches retain exactly the same product register and RAM schedule.
 module pe_grid2x2_1mac_mixed #(
     parameter integer DATA_W = 16,
     parameter integer ACC_W  = 2*DATA_W + 3,
@@ -19,7 +20,9 @@ module pe_grid2x2_1mac_mixed #(
     input  wire                       last_step,
     input  wire [1:0]                 dest,
     input  wire signed [DATA_W-1:0]   a0, a1, b0, b1,
-    output wire signed [ACC_W-1:0]    c00, c01, c10, c11,
+    input  wire                       readout_valid,
+    input  wire [1:0]                 readout_dest,
+    output wire signed [ACC_W-1:0]    readout_data,
     output logic                      chunk_done
 );
     localparam integer PROD_W = 2*DATA_W;
@@ -27,10 +30,13 @@ module pe_grid2x2_1mac_mixed #(
     wire signed [DATA_W-1:0] b_selected = dest[0] ? b1 : b0;
     wire signed [PROD_W-1:0] product_comb;
     logic signed [PROD_W-1:0] product;
-    logic signed [ACC_W-1:0] c [0:3];
+    wire signed [ACC_W-1:0] acc_q, acc_next;
     wire signed [ACC_W-1:0] extended_product;
     logic product_valid, product_first, product_last;
     logic [1:0] product_dest;
+    wire acc_rd_en = !rst && (step_valid || readout_valid);
+    wire [1:0] acc_rd_addr = step_valid ? dest : readout_dest;
+    wire acc_wr_en = !rst && product_valid;
 
     // Quartus applies multstyle to the multiplication directly assigned to
     // the attributed variable. Literal attributes avoid string parameters.
@@ -48,17 +54,19 @@ module pe_grid2x2_1mac_mixed #(
     endgenerate
 
     assign extended_product = {{(ACC_W-PROD_W){product[PROD_W-1]}}, product};
-    assign c00 = c[0];
-    assign c01 = c[1];
-    assign c10 = c[2];
-    assign c11 = c[3];
+    assign acc_next = product_first ? extended_product : acc_q + extended_product;
+    assign readout_data = acc_q;
+
+    grid_accum_bram #(.ACC_W(ACC_W)) u_accum (
+        .clk(clk), .rd_en(acc_rd_en), .rd_addr(acc_rd_addr), .rd_data(acc_q),
+        .wr_en(acc_wr_en), .wr_addr(product_dest), .wr_data(acc_next)
+    );
 
     always_ff @(posedge clk) begin
         if (step_valid && !rst)
             product <= product_comb;
     end
 
-    integer n;
     always_ff @(posedge clk) begin
         if (rst) begin
             product_valid <= 1'b0;
@@ -66,8 +74,6 @@ module pe_grid2x2_1mac_mixed #(
             product_last <= 1'b0;
             product_dest <= 2'd0;
             chunk_done <= 1'b0;
-            for (n = 0; n < 4; n = n + 1)
-                c[n] <= '0;
         end else begin
             product_valid <= step_valid;
             chunk_done <= product_valid && product_last;
@@ -76,9 +82,6 @@ module pe_grid2x2_1mac_mixed #(
                 product_first <= first_step;
                 product_last <= last_step;
             end
-            if (product_valid)
-                c[product_dest] <= product_first ? extended_product :
-                                  c[product_dest] + extended_product;
         end
     end
 endmodule
